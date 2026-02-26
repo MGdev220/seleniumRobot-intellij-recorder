@@ -51,7 +51,8 @@ public class SeleniumActionServer {
             if (server != null) {
                 try {
                     server.stop();
-                } catch (Exception e) {}
+                } catch (Exception e) {
+                }
                 server = null;
             }
         }

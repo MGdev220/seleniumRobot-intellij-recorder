@@ -23,7 +23,7 @@ public class ChromeStarter {
 
     public Path getExtensionPath() throws IOException {
 
-        Path extensionPath = Paths.get(System.getenv("LOCALAPPDATA"), "selenium-ide");
+        Path extensionPath = Paths.get(System.getenv("LOCALAPPDATA"), "recorder1");
         Files.createDirectories(extensionPath);
 
         return extensionPath;
@@ -38,9 +38,9 @@ public class ChromeStarter {
     private String unpackExtension() throws IOException {
 
         Path extensionPath = getExtensionPath();
-        Path zipExtensionPath = extensionPath.resolve("selenium-ide.zip");
+        Path zipExtensionPath = extensionPath.resolve("recorder1.zip");
 
-        InputStream seleniumIdeStream = ChromeStarter.class.getResourceAsStream("/selenium-ide.zip");
+        InputStream seleniumIdeStream = ChromeStarter.class.getResourceAsStream("/recorder1.zip");
         try (InputStream is = seleniumIdeStream) {
             Files.copy(is, zipExtensionPath);
         } catch (IOException e) {
@@ -50,7 +50,7 @@ public class ChromeStarter {
         unpackExtension(zipExtensionPath.toString(), extensionPath.toFile());
         zipExtensionPath.toFile().delete();
 
-        return extensionPath.resolve("selenium-ide").toString();
+        return getExtensionPath().toString();
     }
 
     private void unpackExtension(String extensionPath, File unpackPath) throws IOException {
@@ -109,15 +109,24 @@ public class ChromeStarter {
     public boolean startChrome(String chromePath) throws IOException {
         boolean chromeAlreadyRunning = isChromeRunning();
 
-        Runtime.getRuntime().exec(String.format("\"%s\" --allow-legacy-extension-manifests --load-extension=\"%s\" --no-first-run --disable-popup-blocking --no-default-browser-check --disable-translate ", chromePath, unpackExtension()));
 
+        String extensionPath = unpackExtension();
+        System.out.println("Chemin utilisé pour charger l'extension : " + extensionPath);
+
+
+        //retirer --allow-legacy-extension-manifests done
+        //--load-extension ne marche plus! supposez pour le moment qu'à chaque fois il faut charger manuelement l'extension
+        Runtime.getRuntime().exec(String.format("\"%s\" --load-extension=\"%s\" --no-first-run --disable-popup-blocking --no-default-browser-check --disable-translate", chromePath, extensionPath));
         return chromeAlreadyRunning;
+
     }
 
     private boolean isChromeRunning() {
+
         return ProcessHandle.allProcesses().map(processHandle -> processHandle.info().command().orElse("NO_COMMAND"))
                 .filter(name -> name.contains("chrome") && !name.contains("chromedriver"))
                 .count() > 0;
+
     }
 
     public static void main(String[] args) {
@@ -127,5 +136,8 @@ public class ChromeStarter {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+
     }
+
+
 }
