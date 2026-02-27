@@ -35,9 +35,28 @@ public class ImportBuilder {
         Set<String> imports = new HashSet<>();
 
         for (SeleniumAction a : actions) {
+
+            if (a.getFramePath() != null && !a.getFramePath().isEmpty()) {
+                addImport(imports, "FrameElement");
+            }
+
+            // Import de l’élément détecté
             addImport(imports, a.getElementType());
-            if (a.getSelector().startsWith("By.")) addImport(imports, "By");
-            if (a.getFormattedCommand().contains("Keys.")) addImport(imports, "Keys");
+
+            // Import Selenium By
+            if (a.getSelector().startsWith("By.")) {
+                addImport(imports, "By");
+            }
+
+            //  ByC (SeleniumRobot)
+            if (a.getSelector().contains("ByC.")) {
+                imports.add("import com.seleniumtests.uipage.ByC;");
+            }
+
+            // Import Keys (sendKeys)
+            if (a.getFormattedCommand().contains("Keys.")) {
+                addImport(imports, "Keys");
+            }
         }
 
         return imports.stream().sorted().collect(Collectors.toCollection(LinkedHashSet::new));

@@ -46,11 +46,6 @@ public class SeleniumServlet extends HttpServlet {
                 SeleniumAction action = new Gson().fromJson(request.getReader(), SeleniumAction.class);
 
 
-                // 2) IFRAME CONTEXT
-                FrameContextManager fcm = SeleniumRecorderState.getFrameContextManager(project);
-                fcm.ensureFrameContext(action.getFramePath());
-                insertFrameContextLines(editor, fcm.consumePendingLines());
-
 //imports
                 insertImports(editor, action);
 
@@ -80,21 +75,140 @@ public class SeleniumServlet extends HttpServlet {
     /**
      * Insert element into class if it does not exist
      */
+
+    /**
+     * Insert element into class if it does not exist
+     * - Insère les FrameElement en haut du corps de la classe (après '{'), sur une frontière de ligne
+     * - Insère les autres éléments juste après le dernier FrameElement, sur une frontière de ligne
+     * - Évite toute coupure de ligne (insertion milieu de ligne)
+     */
     private String insertElement(Editor editor, SeleniumAction seleniumAction) {
 
-        String code = seleniumAction.getWebElementString();
-        String content = editor.getDocument().getText();
+        WriteCommandAction.runWriteCommandAction(project, () -> {
 
-        // do not recreate element if it already exists
-        if (!content.contains(seleniumAction.getElementName())) {
-            int firstElementPosition = Math.max(0, content.indexOf("{")) + 1;
+            var doc = editor.getDocument();
+            String text = doc.getText();
 
-            WriteCommandAction.runWriteCommandAction(project, () ->
-                    editor.getDocument().insertString(firstElementPosition, code)
-            );
-        }
+            // --- 1) Position sûre: début du corps de classe (après '{' + fin de ligne)
+            int classOpen = text.indexOf('{');
+            if (classOpen < 0) {
+                return; // fichier non conforme
+            }
+            int classBodyStart = indexAfterLineEnd(text, classOpen); // insertion ligne-sûre
+
+            // --- 2) Dernière fin de déclaration de frame (fin de ligne)
+            int framesBlockEnd = findAfterLastFrameDeclLineEnd(text, classBodyStart);
+
+            // --- 3) Si l'action concerne un frame, insérer le FrameElement (en haut)
+            if (seleniumAction.getFramePath() != null && !seleniumAction.getFramePath().isEmpty()) {
+
+                FrameInfo fr = seleniumAction.getFramePath().get(seleniumAction.getFramePath().size() - 1);
+
+                String frameVarName = buildFrameVarName(fr); // même algo que côté action, voir plus bas
+                String selector = fr.getSelector();
+                if (selector == null || selector.trim().isEmpty() || "null".equals(selector.trim())) {
+                    selector = "By.cssSelector(\"iframe\")"; // fallback
+                }
+
+                String frameDecl =
+                        "\n\tprivate static FrameElement " + frameVarName +
+                                " = new FrameElement(\"" + buildFrameId(fr) + "\", " + selector + ");\n";
+
+                // Si pas déjà présent, on l'insère au top des frames (après le dernier frame si existant)
+                if (!containsExactFrameDecl(text, frameVarName)) {
+                    int insertPos = (framesBlockEnd != -1) ? framesBlockEnd : classBodyStart;
+                    doc.insertString(insertPos, frameDecl);
+
+                    // MAJ du texte et recalcule framesBlockEnd après insertion
+                    text = doc.getText();
+                    framesBlockEnd = findAfterLastFrameDeclLineEnd(text, classBodyStart);
+                }
+            }
+
+            // --- 4) Insérer l'élément "normal" (HtmlElement, TextFieldElement, ...) après les frames
+            String elementCode = seleniumAction.getWebElementString();
+            String elementType = seleniumAction.getElementType();
+            String elementName = seleniumAction.getElementName();
+
+            if (!containsExactElementDecl(text, elementType, elementName)) {
+                int insertPos = (framesBlockEnd != -1) ? framesBlockEnd : classBodyStart;
+                // si aucun frame, on ajoute un saut de ligne pour l'esthétique
+                String block = (framesBlockEnd == -1 ? "\n" : "") + elementCode;
+                doc.insertString(insertPos, block);
+            }
+        });
+
         return null;
     }
+
+    /* ======== Helpers d'insertion sûrs ======== */
+
+    /**
+     * Renvoie l'index juste après la fin de ligne qui contient 'pos'
+     */
+    private int indexAfterLineEnd(String text, int pos) {
+        int nl = text.indexOf('\n', pos);
+        return nl >= 0 ? nl + 1 : pos + 1;
+    }
+
+    /**
+     * Renvoie la fin de ligne suivant la dernière déclaration de FrameElement, ou -1 si aucun.
+     */
+    private int findAfterLastFrameDeclLineEnd(String text, int searchStart) {
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+                "(?m)^\\s*private\\s+static\\s+FrameElement\\s+\\w+\\s*=\\s*new\\s+FrameElement\\s*\\([^;]*\\);\\s*$"
+        );
+        java.util.regex.Matcher m = p.matcher(text);
+        int afterLineEnd = -1;
+        while (m.find(searchStart)) {
+            int lineEnd = text.indexOf('\n', m.end());
+            afterLineEnd = (lineEnd == -1) ? text.length() : lineEnd + 1;
+            searchStart = m.end();
+        }
+        return afterLineEnd;
+    }
+
+    /**
+     * Détecte la déclaration exacte du frame (précis, pour éviter les faux positifs).
+     */
+    private boolean containsExactFrameDecl(String text, String frameVarName) {
+        String pattern = "(?m)^\\s*private\\s+static\\s+FrameElement\\s+" + java.util.regex.Pattern.quote(frameVarName) + "\\s*=";
+        return java.util.regex.Pattern.compile(pattern).matcher(text).find();
+    }
+
+    /**
+     * Détecte précisément la déclaration d'un élément donné.
+     */
+    private boolean containsExactElementDecl(String text, String elementType, String elementName) {
+        String pattern = "(?m)^\\s*private\\s+static\\s+" + java.util.regex.Pattern.quote(elementType) +
+                "\\s+" + java.util.regex.Pattern.quote(elementName) + "\\s*=";
+        return java.util.regex.Pattern.compile(pattern).matcher(text).find();
+    }
+
+    /* ======== Nommage / ID de frame cohérents avec SeleniumAction ======== */
+
+    /**
+     * ID logique de la frame (id si dispo, sinon hash du selector)
+     */
+    private String buildFrameId(FrameInfo fr) {
+        String id = fr.getId();
+        if (id != null && !id.isBlank()) {
+            return id;
+        }
+        String sel = String.valueOf(fr.getSelector());
+        String hash = Integer.toHexString(sel.hashCode());
+        return "frame_" + hash;
+    }
+
+    /**
+     * Nom de variable Java pour la frame, DOIT MATCHER SeleniumAction
+     */
+    private String buildFrameVarName(FrameInfo fr) {
+        String frameId = buildFrameId(fr);
+        String sanitized = frameId.replaceAll("[^A-Za-z0-9_]", "_");
+        return "frame_" + sanitized;
+    }
+
 
     private void insertElementAction(Editor editor, SeleniumAction seleniumAction) {
 
@@ -275,4 +389,68 @@ public class SeleniumServlet extends HttpServlet {
             doc.insertString(insertPos, block + "\n");
         });
     }
+
+
+    /**
+     * Retourne la position de l'accolade ouvrante de la classe (après la signature 'class ... {')
+     */
+    private int findClassOpenBracePos(String text) {
+        // naïf mais efficace : on cherche la première '{' après "class "
+        int classIdx = text.indexOf("class ");
+        if (classIdx < 0) {
+            // fallback: première '{' tout court
+            int brace = text.indexOf('{');
+            return brace >= 0 ? brace + 1 : 0;
+        }
+        int brace = text.indexOf('{', classIdx);
+        return brace >= 0 ? brace + 1 : Math.max(0, text.indexOf('{') + 1);
+    }
+
+    /**
+     * Retourne la fin du dernier 'private static FrameElement ...;' trouvé
+     * (ou -1 s'il n'y en a pas)
+     */
+    private int findLastFrameDeclEnd(String text, int afterPos) {
+        java.util.regex.Pattern framePat = java.util.regex.Pattern.compile(
+                "(?m)^\\s*private\\s+static\\s+FrameElement\\s+\\w+\\s*=\\s*new\\s+FrameElement\\s*\\([^;]*\\);\\s*$"
+        );
+        java.util.regex.Matcher m = framePat.matcher(text);
+        int lastEnd = -1;
+        while (m.find()) {
+            if (m.start() >= afterPos) {
+                lastEnd = m.end();
+            }
+        }
+        return lastEnd;
+    }
+
+    /**
+     * Garantit qu'une déclaration de FrameElement est située dans la "zone frame"
+     * (juste après l'accolade ouvrante), en tête des champs.
+     * Si déjà présente, ne fait rien.
+     */
+    private void ensureFrameDeclAtTop(Editor editor, String frameVarName, String frameDecl) {
+        WriteCommandAction.runWriteCommandAction(project, () -> {
+            var doc = editor.getDocument();
+            String text = doc.getText();
+
+            // si déjà présent, on ne réinsère pas
+            if (text.contains("private static FrameElement " + frameVarName + " ")) {
+                return;
+            }
+
+            // base = après l'accolade ouvrante
+            int classOpenPos = findClassOpenBracePos(text);
+
+            // fin du dernier frame existant
+            int lastFrameEnd = findLastFrameDeclEnd(text, classOpenPos);
+
+            int insertPos = (lastFrameEnd != -1) ? lastFrameEnd : classOpenPos;
+
+            // si on insère juste après '{', ajoutons un saut de ligne de confort
+            String block = ((lastFrameEnd == -1) ? "\n" : "") + frameDecl;
+            doc.insertString(insertPos, block);
+        });
+    }
+
 }
