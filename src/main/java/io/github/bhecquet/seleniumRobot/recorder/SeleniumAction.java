@@ -113,23 +113,6 @@ public class SeleniumAction {
                 break;
 
 
-            case "sw_fr":
-                FrameInfo fr = framePath.get(framePath.size() - 1);
-                return String.format(
-                        "\t\tHtmlElement iframe = new HtmlElement(\"iframe\", %s);\n\t\tiframe.switchToFrame();\n",
-                        fr.getSelector()
-                );
-
-
-            case "fr_root":
-
-                return "\t\tio.github.bhecquet.seleniumrobot.core.context.SeleniumRobotContext.getWebDriver().switchTo().defaultContent();\n";
-
-
-            case "fr_up":
-                return "\t\tio.github.bhecquet.seleniumrobot.core.context.SeleniumRobotContext.getWebDriver().switchTo().parentFrame();\n";
-
-
             case "selectWindow":
                 action = "selectNewWindow";
                 break;
@@ -174,13 +157,24 @@ public class SeleniumAction {
                 elementName
         )) + "\"";
 
-        return String.format("\n\tprivate static %s %s = new %s(%s, %s);\n",
+        String frameRef = "";
+        if (framePath != null && !framePath.isEmpty()) {
+            FrameInfo fr = framePath.get(framePath.size() - 1);
+            String frameName = "frame_" + fr.getId();
+            frameRef = ", " + frameName;
+        }
+
+
+        return String.format(
+                "\n\tprivate static %s %s = new %s(%s, %s%s);\n",
                 elementType,
                 elementName,
                 elementType,
                 logicalName,
-                selector
+                selector,
+                frameRef
         );
+
     }
 
 
@@ -260,9 +254,7 @@ public class SeleniumAction {
             case "css":
             case "css:finder":
                 // raw est déjà un sélecteur CSS
-                if (raw.equalsIgnoreCase("css")) return null;
-                return String.format("By.cssSelector(\"%s\")", escape(raw));
-
+                return buildBestByCFromCss(raw);
             case "xpath":
             case "xpath:attributes":
             case "xpath:idRelative":
@@ -271,18 +263,98 @@ public class SeleniumAction {
             case "xpath:href":
             case "xpath:innerText":
             case "xpath:img":
-                return String.format("By.xpath(\"%s\")", escape(raw));
+
+                String aria = extractAttributeFromXPath(raw, "aria-label");
+                if (aria != null) {
+                    return "ByC.ariaLabel(\"" + escape(aria) + "\")";
+                }
+
+                // 2) data-testid dans le xpath
+                String dt = extractAttributeFromXPath(raw, "data-testid");
+                if (dt != null) {
+                    return "ByC.dataTestId(\"" + escape(dt) + "\")";
+                }
+
+                // 3) id dans le xpath (rare mais possible)
+                String id = extractAttributeFromXPath(raw, "id");
+                if (id != null) {
+                    return "ByC.id(\"" + escape(id) + "\")";
+                }
+
+                // fallback
+                return "By.xpath(\"" + escape(raw) + "\")";
+
 
             default:
                 return null;
         }
     }
 
+    private String extractAttributeFromXPath(String raw, String attributeName) {
+        if (raw == null) return null;
+
+        // enlever prefix xpath=
+        if (raw.startsWith("xpath=")) raw = raw.substring(6);
+
+        Pattern p = Pattern.compile(attributeName + "\\s*=\\s*['\"]([^'\"]+)['\"]");
+        Matcher m = p.matcher(raw);
+        if (m.find()) return m.group(1);
+
+        return null;
+    }
+
+
+    private String buildBestByCFromCss(String css) {
+        if (css == null) return null;
+        if (css.startsWith("css=")) css = css.substring(4);
+        String s = css.trim();
+
+
+        if (s.matches("^#([A-Za-z0-9_-]+)$")) {
+            return String.format("ByC.id(\"%s\")", escape(s.substring(1)));
+        }
+
+
+        java.util.regex.Matcher idMatcher =
+                java.util.regex.Pattern.compile("\\[id=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
+        if (idMatcher.find()) {
+            return String.format("ByC.id(\"%s\")", escape(idMatcher.group(1)));
+        }
+
+
+        java.util.regex.Matcher nameMatcher =
+                java.util.regex.Pattern.compile("\\[name=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
+        if (nameMatcher.find()) {
+            return String.format("ByC.name(\"%s\")", escape(nameMatcher.group(1)));
+        }
+
+
+        java.util.regex.Matcher dtMatcher =
+                java.util.regex.Pattern.compile("\\[data-testid=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
+        if (dtMatcher.find()) {
+            return String.format("ByC.dataTestId(\"%s\")", escape(dtMatcher.group(1)));
+        }
+
+
+        java.util.regex.Matcher ariaMatcher =
+                java.util.regex.Pattern.compile("\\[aria-label=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
+        if (ariaMatcher.find()) {
+            return String.format("ByC.ariaLabel(\"%s\")", escape(ariaMatcher.group(1)));
+        }
+
+
+        if (s.matches("^[A-Za-z][A-Za-z0-9_-]*$")) {
+            return String.format("ByC.tag(\"%s\")", escape(s));
+        }
+
+
+        return String.format("By.cssSelector(\"%s\")", escape(s));
+    }
 
     // ------------------ ELEMENT NAME ------------------
 
     public String getElementName() {
-        // Construire un nom explicite basé sur id/name/placeholder/aria/linkText
+
         String base = firstNonEmpty(
                 extractIdFromTargets(),
                 extractNameFromTargets(),
@@ -387,7 +459,7 @@ public class SeleniumAction {
         if (isButton) return "ButtonElement";
         if (isCheckbox) return "CheckBoxElement";
         if (isSelect) return "ListSelect";
-        if (isFrame) return "HtmlElement";
+        if (isFrame) return "FrameElement";
         if (isText || isTypingCommand) return "TextFieldElement";
         if (isImage) return "ImageElement";
 

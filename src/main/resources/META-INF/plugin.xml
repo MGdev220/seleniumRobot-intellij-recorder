@@ -10,6 +10,11 @@
 
     <extensions defaultExtensionNs="com.intellij">
 
+
+        <applicationService
+                serviceImplementation="io.github.bhecquet.seleniumRobot.recorder.server.JettyService"/>
+
+
     </extensions>
 
     <actions>
@@ -21,7 +26,8 @@
         <action id="io.github.bhecquet.seleniumRobot.recorder.actions.StopServerAction"
                 class="io.github.bhecquet.seleniumRobot.recorder.actions.StopServerAction" text="Stop Selenium record"
                 description="Stop Selenium recording">
-            <add-to-group group-id="ToolsMenu" anchor="after" relative-to-action="io.github.bhecquet.seleniumRobot.recorder.actions.StartServerAction"/>
+            <add-to-group group-id="ToolsMenu" anchor="after"
+                          relative-to-action="io.github.bhecquet.seleniumRobot.recorder.actions.StartServerAction"/>
         </action>
     </actions>
 </idea-plugin>
