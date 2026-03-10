@@ -1,5 +1,10 @@
 
 # SeleniumRobot recorder
+Cette extension est fortement inspirée de SeleniumBase Recorder.
+Le projet original a été réalisé par Michael Mintz.
+Cette version est une adaptation et évolution pour le plugin SeleniumRobot Recorder développé par Covéa.
+Limits: 
+- Only one server can be started at the same time among all intelliJ instances
 
 
 1.Installation du recorder manuellement
@@ -28,11 +33,5 @@ Redémarrez IntelliJ lorsque cela est demandé
 Le plugin est maintenant installé.
 
 
-IntelliJ plugin that allow to record Selenium IDE actions to IntelliJ
 
-<!-- Plugin description -->
-Plugin that allows to format SeleniumRobot code inside an IntelliJ project, using Selenium IDE extension as a recording tool
-<!-- Plugin description end -->
 
-Limits: 
-- Only one server can be started at the same time among all intelliJ instances
