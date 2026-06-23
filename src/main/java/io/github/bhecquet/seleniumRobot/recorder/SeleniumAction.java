@@ -1,6 +1,5 @@
 package io.github.bhecquet.seleniumRobot.recorder;
 
-import java.text.Normalizer;
 import java.util.List;
 import java.util.Locale;
 import java.util.regex.Matcher;
@@ -41,48 +40,87 @@ public class SeleniumAction {
             case "keydown":
             case "keyup":
                 action = "sendKeys";
-                formattedValue = formatKeyValue(value); // ${KEY_ENTER} -> Keys.ENTER
+                formattedValue = formatKeyValue(value);
                 break;
 
+
             case "doubleClick":
+            case "dblclick":
                 action = "doubleClickAction";
                 break;
 
+
             case "click":
+
             case "check":
-            case "uncheck":
-                action = "click";
+                if ("CheckBoxElement".equals(getElementType())) {
+                    action = "check";
+                } else {
+                    action = "click";
+                }
                 break;
+
+            case "uncheck":
+                if ("CheckBoxElement".equals(getElementType())) {
+                    action = "uncheck";
+                } else {
+                    action = "click";
+                }
+                break;
+
 
             case "dragAndDropToObject":
                 action = "dragAndDropTo";
                 formattedValue = "";
                 break;
-
+            case "contextmenu":
+                action = "contextMenuAction";
+                break;
 
             case "select":
-
                 if (value != null && value.startsWith("label=")) {
                     action = "selectByText";
                     formattedValue = "\"" + escape(value.replace("label=", "").trim()) + "\"";
-
                 } else if (value != null && value.startsWith("value=")) {
                     action = "selectByValue";
                     formattedValue = "\"" + escape(value.replace("value=", "").trim()) + "\"";
-
                 } else if (value != null && value.startsWith("index=")) {
                     action = "selectByIndex";
                     formattedValue = value.replace("index=", "").trim();
-
                 } else {
 
-                    if (value == null || value.trim().isEmpty()) {
+                    String selText = getSelectedTextSafe(); // <-- helper ci-dessous
+                    if (selText != null && !selText.isBlank()) {
+                        action = "selectByText";
+                        formattedValue = "\"" + escape(selText.trim()) + "\"";
+                    } else if (value == null || value.trim().isEmpty()) {
                         action = "selectByIndex";
                         formattedValue = "0";
                     } else {
                         action = "selectByValue";
                         formattedValue = "\"" + escape(value.trim()) + "\"";
                     }
+                }
+                break;
+
+            case "change":
+
+                if ("SelectList".equals(getElementType())) {
+                    String selText = getSelectedTextSafe();
+                    if (selText != null && !selText.isBlank()) {
+                        action = "selectByText";
+                        formattedValue = "\"" + escape(selText.trim()) + "\"";
+                    } else if (value != null && !value.trim().isEmpty()) {
+                        action = "selectByValue";
+                        formattedValue = "\"" + escape(value.trim()) + "\"";
+                    } else {
+                        action = "selectByIndex";
+                        formattedValue = "0";
+                    }
+                } else {
+
+                    action = "click";
+                    formattedValue = null;
                 }
                 break;
 
@@ -109,7 +147,6 @@ public class SeleniumAction {
                 break;
 
             case "selectFrame":
-                action = null;
                 break;
 
 
@@ -144,7 +181,6 @@ public class SeleniumAction {
         String elementType = getElementType();
         String selector = getSelector();
 
-        // Ajout du nom logique (placeholder/aria/id/name plutôt que la valeur brute)
 
         String logicalName = "\"" + escape(firstNonEmpty(
                 extractAriaLabelFromTargets(),
@@ -160,8 +196,8 @@ public class SeleniumAction {
         String frameRef = "";
         if (framePath != null && !framePath.isEmpty()) {
             FrameInfo fr = framePath.get(framePath.size() - 1);
-            String frameName = "frame_" + fr.getId();
-            frameRef = ", " + frameName;
+            String frameVar = frameVarNameFrom(fr); // voir helper ci-dessous
+            frameRef = ", " + frameVar;
         }
 
 
@@ -177,6 +213,18 @@ public class SeleniumAction {
 
     }
 
+    private String computeFrameLogicalId(FrameInfo fr) {
+        String id = fr.getId();
+        if (id != null && !id.isBlank()) return id.trim();
+        String sel = String.valueOf(fr.getSelector());
+        return Integer.toHexString(sel.hashCode());
+    }
+
+    private String frameVarNameFrom(FrameInfo fr) {
+        String logicalId = computeFrameLogicalId(fr);
+        String sanitized = logicalId.replaceAll("[^A-Za-z0-9_]", "_");
+        return "frame_" + sanitized;
+    }
 
     protected String getSelector() {
 
@@ -204,7 +252,7 @@ public class SeleniumAction {
                 }
             } else if ("ButtonElement".equals(elemType)) {
                 selector = "By.cssSelector(\"button, input[type='button'], input[type='submit'], input[type='reset']\")";
-            } else if ("ListSelect".equals(elemType)) {
+            } else if ("SelectList".equals(elemType)) {
                 selector = "By.cssSelector(\"select\")";
             } else if ("CheckBoxElement".equals(elemType)) {
                 selector = "By.cssSelector(\"input[type='checkbox']\")";
@@ -239,13 +287,38 @@ public class SeleniumAction {
                 return String.format("By.cssSelector(\"[data-testid='%s']\")", escape(raw));
 
             case "id":
+
+
+                if (raw != null && raw.matches("(mat-.*|cdk-.*|ng-.*|.*-\\d+)")) {
+
+                    String prefix = raw.contains("-") ? raw.split("-")[0] : raw;
+
+                    return "By.xpath(\"//*[contains(@id,'" + escape(prefix) + "')]\")";
+
+                }
+
                 return String.format("By.id(\"%s\")", escape(raw));
+
 
             case "name":
                 return String.format("By.name(\"%s\")", escape(raw));
 
             case "linkText":
-                return String.format("By.linkText(\"%s\")", escape(raw));
+
+
+                String cleaned = raw.replace("\u00A0", " ")
+                        .replaceAll("\\s+", " ")
+                        .trim();
+
+
+                if (cleaned.length() > 40 || raw.contains("\u00A0") || raw.contains("  ")) {
+
+                    return "By.xpath(\"//*[contains(normalize-space(.),'"
+                            + escape(cleaned.substring(0, Math.min(30, cleaned.length())))
+                            + "')]\")";
+                }
+
+                return "By.linkText(\"" + escape(cleaned) + "\")";
 
             case "ariaLabel":
             case "aria-label":
@@ -253,7 +326,7 @@ public class SeleniumAction {
 
             case "css":
             case "css:finder":
-                // raw est déjà un sélecteur CSS
+
                 return buildBestByCFromCss(raw);
             case "xpath":
             case "xpath:attributes":
@@ -264,30 +337,98 @@ public class SeleniumAction {
             case "xpath:innerText":
             case "xpath:img":
 
-                String aria = extractAttributeFromXPath(raw, "aria-label");
-                if (aria != null) {
-                    return "ByC.ariaLabel(\"" + escape(aria) + "\")";
-                }
-
-                // 2) data-testid dans le xpath
                 String dt = extractAttributeFromXPath(raw, "data-testid");
                 if (dt != null) {
                     return "ByC.dataTestId(\"" + escape(dt) + "\")";
                 }
 
-                // 3) id dans le xpath (rare mais possible)
-                String id = extractAttributeFromXPath(raw, "id");
-                if (id != null) {
-                    return "ByC.id(\"" + escape(id) + "\")";
+                String aria = extractAttributeFromXPath(raw, "aria-label");
+                if (aria != null && aria.length() < 40) {
+                    return "ByC.ariaLabel(\"" + escape(aria) + "\")";
                 }
 
-                // fallback
-                return "By.xpath(\"" + escape(raw) + "\")";
+
+                String href = extractAttributeFromXPath(raw, "href");
+
+                if (href != null && href.length() > 10) {
+
+                    String key = href.substring(href.lastIndexOf("/") + 1)
+                            .replaceAll("_\\d+.*", "")
+                            .replace(".html", "");
+
+                    if (key.length() > 5) {
+                        return "By.cssSelector(\"a[href*='" + escape(key) + "']\")";
+                    }
+                }
+
+
+                String id = extractAttributeFromXPath(raw, "id");
+                if (id != null && isBusinessId(id)) {
+                    return "By.id(\"" + escape(id) + "\")";
+                }
+
+
+                if (getElementType().equals("CheckBoxElement")) {
+
+                    String idAttr = extractAttributeFromXPath(raw, "id");
+                    if (idAttr != null) {
+                        return "By.id(\"" + escape(idAttr) + "\")";
+                    }
+
+                    return "By.cssSelector(\"input[type='checkbox']\")";
+                }
+
+
+                String title = extractAttributeFromXPath(raw, "title");
+                if (title != null && title.length() < 50) {
+                    return "By.cssSelector(\"[title='" + escape(title) + "']\")";
+                }
+
+                String text = cleanText(extractLinkTextFromTargets());
+
+                if (raw.startsWith("//div[") || raw.contains("/div[") || raw.length() > 120) {
+
+                    if (text != null && text.length() < 40) {
+                        return "ByC.text(\"" + escape(text) + "\")";
+                    }
+
+                    return "By.xpath(\"" + escape(raw.startsWith("xpath=") ? raw.substring(6) : raw) + "\")";
+                }
+
+
+                if (text != null && !text.isEmpty()) {
+                    return "By.xpath(\"//*[contains(normalize-space(.),'"
+                            + escape(text.substring(0, Math.min(30, text.length())))
+                            + "')]\")";
+                }
+
+
+                return "By.xpath(\"//*[contains(text(), '" + escape(getElementName()) + "')] \")";
 
 
             default:
                 return null;
         }
+    }
+
+    private String cleanText(String text) {
+        if (text == null) return null;
+
+        return text.replace("\u00A0", " ")
+                .replaceAll("\\s+", " ")
+                .trim();
+    }
+
+    private String extractTagFromXPath(String xpath) {
+        try {
+            if (xpath.startsWith("//")) {
+                String tag = xpath.substring(2).split("\\[")[0];
+                return tag;
+            }
+        } catch (Exception ignored) {
+        }
+
+        return "*";
     }
 
     private String extractAttributeFromXPath(String raw, String attributeName) {
@@ -309,168 +450,220 @@ public class SeleniumAction {
         if (css.startsWith("css=")) css = css.substring(4);
         String s = css.trim();
 
+        // 0) REFUSER les paths fragiles (dom path)
+        if (looksLikeDomPath(s)) {
+            return null;
+        }
 
+        // 1) #id => By.id
         if (s.matches("^#([A-Za-z0-9_-]+)$")) {
-            return String.format("ByC.id(\"%s\")", escape(s.substring(1)));
+            return String.format("By.id(\"%s\")", escape(s.substring(1)));
         }
 
-
-        java.util.regex.Matcher idMatcher =
-                java.util.regex.Pattern.compile("\\[id=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
+        // 2) [id='x'] => By.id
+        Matcher idMatcher = Pattern.compile("\\[id=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
         if (idMatcher.find()) {
-            return String.format("ByC.id(\"%s\")", escape(idMatcher.group(1)));
+            return String.format("By.id(\"%s\")", escape(idMatcher.group(1)));
         }
 
-
-        java.util.regex.Matcher nameMatcher =
-                java.util.regex.Pattern.compile("\\[name=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
+        // 3) [name='x'] => By.name
+        Matcher nameMatcher = Pattern.compile("\\[name=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
         if (nameMatcher.find()) {
-            return String.format("ByC.name(\"%s\")", escape(nameMatcher.group(1)));
+            return String.format("By.name(\"%s\")", escape(nameMatcher.group(1)));
         }
 
-
-        java.util.regex.Matcher dtMatcher =
-                java.util.regex.Pattern.compile("\\[data-testid=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
+        // 4) [data-testid='x'] => SeleniumRobot (ByC)
+        Matcher dtMatcher = Pattern.compile("\\[data-testid=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
         if (dtMatcher.find()) {
-            return String.format("ByC.dataTestId(\"%s\")", escape(dtMatcher.group(1)));
+            return "ByC.dataTestId(\"" + escape(dtMatcher.group(1)) + "\")";
         }
 
-
-        java.util.regex.Matcher ariaMatcher =
-                java.util.regex.Pattern.compile("\\[aria-label=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
+        // 5) [aria-label='x'] => SeleniumRobot (ByC)
+        Matcher ariaMatcher = Pattern.compile("\\[aria-label=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
         if (ariaMatcher.find()) {
-            return String.format("ByC.ariaLabel(\"%s\")", escape(ariaMatcher.group(1)));
+            return "ByC.ariaLabel(\"" + escape(ariaMatcher.group(1)) + "\")";
         }
 
+        // 6) [role='x'] => css attribut court (acceptable)
+        Matcher roleMatcher = Pattern.compile("\\[role=['\"]?([^'\"\\]]+)['\"]?\\]").matcher(s);
+        if (roleMatcher.find()) {
+            return String.format("By.cssSelector(\"[role='%s']\")", escape(roleMatcher.group(1)));
+        }
 
+        // 7) tag simple => By.tagName
         if (s.matches("^[A-Za-z][A-Za-z0-9_-]*$")) {
-            return String.format("ByC.tag(\"%s\")", escape(s));
+            return String.format("By.tagName(\"%s\")", escape(s));
         }
 
-
-        return String.format("By.cssSelector(\"%s\")", escape(s));
+        // 8) Sinon: refuser
+        return null;
     }
+
+    private boolean looksLikeDomPath(String css) {
+        if (css == null) return true;
+        String c = css.toLowerCase(Locale.ROOT);
+
+        // nth-of-type => fragile
+        if (c.contains("nth-of-type")) return true;
+
+        // trop profond (espaces ou >)
+        int depth = c.split("\\s+|>").length;
+        if (depth > 3) return true;
+
+        // bruit Angular / Material
+        if (c.contains("ng-star-inserted")) return true;
+
+        // très long => généralement un path
+        if (c.length() > 80) return true;
+
+        return false;
+    }
+
 
     // ------------------ ELEMENT NAME ------------------
 
+    private boolean isBusinessId(String id) {
+        if (id == null) return false;
+
+
+        return !id.matches(
+                "(mat-.*|cdk-.*|ng-.*|.*-\\d+)"
+
+        );
+    }
+
+
     public String getElementName() {
 
+        String text = extractLinkTextFromTargets();
+
+
+        if (text != null) {
+
+            text = cleanText(text);
+
+
+            String[] words = text.split(" ");
+            String shortText = String.join(" ",
+                    java.util.Arrays.copyOfRange(words, 0, Math.min(words.length, 5)));
+
+            return toCamelCase(sanitizeForIdentifier(shortText)) + "Link";
+        }
+
+
+        String id = extractIdFromTargets();
+        if (!isBusinessId(id)) {
+            id = null;
+        }
+
         String base = firstNonEmpty(
-                extractIdFromTargets(),
+                id,
                 extractNameFromTargets(),
-                extractPlaceholder(getSelector()),
                 extractAriaLabel(getSelector()),
                 extractLinkTextFromTargets(),
-
-                sanitizeForIdentifier(firstTargetRawOrEmpty())
+                normalizeCssBasedName(stripGenericTokens(firstTargetRawOrEmpty()))
         );
 
-        String camel = toCamelCase(sanitizeForIdentifier(base));
 
+        String camel = toCamelCase(sanitizeForIdentifier(base));
+        if (camel.isEmpty() || !Character.isJavaIdentifierStart(camel.charAt(0))) {
+            camel = "_" + camel;
+        }
 
         String suffix = suggestSuffixFromType(getElementType());
-        String name = camel + suffix;
 
+        // ---- Nouveau : déterminer si le sélecteur est FORT ----
+        String selector = String.valueOf(getSelector());
+        boolean strongSelector =
+                selector.startsWith("By.id(")
+                        || selector.startsWith("By.name(")
+                        || selector.startsWith("By.linkText(")
+                        || selector.contains("[data-testid=")
+                        || selector.contains("[aria-label=")
+                        || selector.contains("href=");
 
-        if (name.isEmpty() || !Character.isJavaIdentifierStart(name.charAt(0))) {
-            name = "_" + name;
+        if (strongSelector) {
+
+            return camel + suffix;
         }
-        return name;
+
+        String uniq = shortHash(selector);
+        return camel + suffix + "_" + uniq;
     }
 
 
+    private String stripGenericTokens(String s) {
+        if (s == null) return "element";
+        String t = s.toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("nth[- ]?of[- ]?type\\s*\\d+", "")
+                .replaceAll("\\b(div|span|app|container|row|col|section|article|list|item|cell|td|tr)\\b", " ")
+                .replaceAll("[#\\[\\]\\(\\)\\.@=:>'\"/]+", " ")
+                .replaceAll("\\s+", " ").trim();
+        return t.isEmpty() ? "element" : t;
+    }
+
+    private String normalizeCssBasedName(String raw) {
+        if (raw == null) {
+            return null;
+        }
+
+        // supprime les nth-of-type, indices, wrappers Angular
+        String s = raw
+                .replaceAll("nthOfType\\d+", "")
+                .replaceAll("\\d+", "")
+                .replaceAll("ngStarInserted", "")
+                .replaceAll("ngInserted", "");
+
+
+        List<String> keywords = List.of(
+                "grid", "tree", "row", "cell", "node", "menu", "item", "panel", "list", "tab"
+        );
+
+        for (String k : keywords) {
+            if (s.toLowerCase().contains(k)) {
+                return k;
+            }
+        }
+
+        // dernier recours très court
+        return "element";
+    }
+
+
+    private String sanitizeForIdentifier(String s) {
+        if (s == null) return "element";
+        String t = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
+                .replaceAll("\\p{InCombiningDiacriticalMarks}+", "")
+                .replaceAll("[^A-Za-z0-9_ ]", " ")
+                .replaceAll("\\s+", "_").replaceAll("_+", "_")
+                .replaceAll("^_+|_+$", "").toLowerCase(java.util.Locale.ROOT);
+        return t.isEmpty() ? "element" : t;
+    }
+
+    private String shortHash(String data) {
+        int h = (data == null ? 0 : data.hashCode());
+        String hex = Integer.toHexString(h);
+        return (hex.length() > 4) ? hex.substring(hex.length() - 4) : hex;
+    }
+
+    private String crop(String s, int max) {
+        return (s != null && s.length() > max) ? s.substring(0, max) : s;
+    }
 // ------------------ ELEMENT TYPE ------------------
 
-    public String getElementType() {
-
-        final boolean isTypingCommand = "type".equals(command) || "sendKeys".equals(command)
-                || "keydown".equals(command) || "keyup".equals(command);
-        if ("check".equals(command) || "uncheck".equals(command)) {
-            return "CheckBoxElement";
-        }
-
-        if ("select".equals(command) || "removeSelection".equals(command)) {
-            return "ListSelect";
-        }
-
-        if ("selectFrame".equals(command)) {
-            return "FrameElement";
-        }
-        if ("linktext".equals(command)) {
-            return "LinkTextElement";
-        }
-        if ("image".equals(command)) {
-            return "ImageElement";
-        }
-
-
-        boolean isLink = false, isButton = false, isCheckbox = false, isSelect = false, isFrame = false, isText = false, isImage = false;
-
-        for (SeleniumTarget t : getTargets()) {
-            String raw = (t.getTargetSelector() == null) ? "" : t.getTargetSelector().toLowerCase();
-            String type = (t.getTargetType() == null) ? "" : t.getTargetType().toLowerCase();
-
-
-            if ("linktext".equals(type) || containsCssTag(raw, "a") || containsXpathTag(raw, "a") || containsAttribute(raw, "href")) {
-                isLink = true;
-            }
-
-
-            if ("button".equals(type)
-                    || containsCssTag(raw, "button")
-                    || containsXpathTag(raw, "button")
-                    || containsCssInputType(raw, "submit", "button", "reset")
-                    || containsXpathInputType(raw, "submit", "button", "reset")
-                    || containsAriaRole(raw, "button")) {
-                isButton = true;
-            }
-
-
-            if (containsCssInputType(raw, "checkbox") || containsXpathInputType(raw, "checkbox") || containsAriaRole(raw, "checkbox")) {
-                isCheckbox = true;
-            }
-
-
-            if (containsCssTag(raw, "select") || containsXpathTag(raw, "select")) {
-                isSelect = true;
-            }
-
-
-            if (containsCssTag(raw, "iframe") || containsCssTag(raw, "frame")
-                    || containsXpathTag(raw, "iframe") || containsXpathTag(raw, "frame")) {
-                isFrame = true;
-            }
-
-
-            if (containsCssInputType(raw, "text", "email", "password", "url", "tel", "number", "search")
-                    || containsXpathInputType(raw, "text", "email", "password", "url", "tel", "number", "search")
-                    || containsCssTag(raw, "textarea")
-                    || containsXpathTag(raw, "textarea")) {
-                isText = true;
-            }
-
-
-            if (containsCssTag(raw, "img") || containsXpathTag(raw, "img")) {
-                isImage = true;
-            }
-        }
-
-        if (isLink) return "LinkElement";
-        if (isButton) return "ButtonElement";
-        if (isCheckbox) return "CheckBoxElement";
-        if (isSelect) return "ListSelect";
-        if (isFrame) return "FrameElement";
-        if (isText || isTypingCommand) return "TextFieldElement";
-        if (isImage) return "ImageElement";
-
-        return "HtmlElement";
-    }
 
     /**
      * =========================
      * Helpers d’analyse CSS / XPath / ARIA
      * =========================
      **/
+
+    private String selectedText;
+
+    public String getSelectedTextSafe() {
+        return selectedText;
+    }
+
 
     private boolean containsCssTag(String raw, String tag) {
         if (raw == null || raw.isEmpty()) return false;
@@ -485,6 +678,17 @@ public class SeleniumAction {
         s = s.replace("\"", "").replace("'", "");
         return s.matches("(?i).*(//|/descendant::)" + tag + "(\\b|\\[).*");
     }
+
+    private boolean isSelectFromTargets() {
+        for (SeleniumTarget t : getTargets()) {
+            String raw = (t.getTargetSelector() == null) ? "" : t.getTargetSelector().toLowerCase();
+            if (containsCssTag(raw, "select") || containsXpathTag(raw, "select")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
 
     private boolean containsCssInputType(String raw, String... types) {
         if (raw == null || raw.isEmpty()) return false;
@@ -591,16 +795,6 @@ public class SeleniumAction {
      * --- extraction attributs depuis selector/targets ---
      **/
 
-    private String extractAfterEqual(String s) {
-        int i = s.indexOf('=');
-        return (i >= 0 && i < s.length() - 1) ? s.substring(i + 1).trim() : s.trim();
-    }
-
-    private String stripPrefix(String s, String prefix) {
-        if (s.startsWith(prefix + "=")) return s.substring(prefix.length() + 1);
-        if (s.startsWith(prefix + ":")) return s.substring(prefix.length() + 1);
-        return s;
-    }
 
     private String extractAriaLabel(String sOrSelector) {
         if (sOrSelector == null) return null;
@@ -657,28 +851,6 @@ public class SeleniumAction {
 
     // --- noms & formatage ---
 
-    private String sanitizeForIdentifier(String s) {
-        if (s == null) return "element";
-        String t = Normalizer.normalize(s, Normalizer.Form.NFD)
-                .replaceAll("\\p{InCombiningDiacriticalMarks}+", ""); // enlève accents
-        t = t.replace("/", "")
-                .replace(":", "_")
-                .replace("=", "_")
-                .replace("[", "")
-                .replace("]", "")
-                .replace("(", "")
-                .replace(")", "")
-                .replace("@", "")
-                .replace("'", "")
-                .replace("-", "_")
-                .replace(".", "")
-                .replace(" ", "_")
-                .replace("#", "");
-        t = t.replaceAll("[^A-Za-z0-9_]", "_").toLowerCase(Locale.ROOT);
-        t = t.replaceAll("_+", "_").replaceAll("^_+", "").replaceAll("_+$", "");
-        if (t.isEmpty()) t = "element";
-        return t;
-    }
 
     private String toCamelCase(String s) {
         String[] parts = s.split("_");
@@ -697,7 +869,7 @@ public class SeleniumAction {
         switch (elementType) {
             case "TextFieldElement":
                 return "Field";
-            case "ListSelect":
+            case "SelectList":
                 return "Select";
             case "ButtonElement":
                 return "Button";
@@ -728,4 +900,129 @@ public class SeleniumAction {
         for (String s : vals) if (s != null && !s.trim().isEmpty()) return s.trim();
         return "element";
     }
+
+    public String getElementType() {
+
+        final boolean isTypingCommand = "type".equals(command) || "sendKeys".equals(command)
+                || "keydown".equals(command) || "keyup".equals(command);
+        if ("check".equals(command) || "uncheck".equals(command)) {
+            return "CheckBoxElement";
+        }
+
+
+        for (SeleniumTarget t : getTargets()) {
+            String raw = t.getTargetSelector() == null ? "" : t.getTargetSelector().toLowerCase();
+
+            if (containsCssInputType(raw, "checkbox") || containsXpathInputType(raw, "checkbox")) {
+                return "CheckBoxElement";
+            }
+        }
+
+
+        if ("select".equals(command) || "change".equals(command)) {
+            return "SelectList";
+        }
+
+
+        String selector_ = String.valueOf(getSelector()).toLowerCase();
+        if (selector_.contains("select") || selector_.contains("dropdown")) {
+            return "SelectList";
+        }
+
+
+        for (SeleniumTarget t : getTargets()) {
+            String raw = t.getTargetSelector() == null ? "" : t.getTargetSelector().toLowerCase();
+
+            if (containsCssTag(raw, "select") || containsXpathTag(raw, "select")) {
+                return "SelectList";
+            }
+        }
+
+
+        if ("change".equals(command)) {
+
+
+            boolean looksLikeSelect = selector_.contains("dropdown")
+                    || selector_.matches(".*By\\.(id|name)\\(\".*(select|dropdown).*\"\\).*");
+            if (looksLikeSelect || isSelectFromTargets()) {
+                return "SelectList";
+            }
+        }
+
+
+        if ("selectFrame".equals(command)) {
+            return "FrameElement";
+        }
+        if ("linktext".equals(command)) {
+            return "LinkTextElement";
+        }
+        if ("image".equals(command)) {
+            return "ImageElement";
+        }
+
+
+        boolean isLink = false, isButton = false, isCheckbox = false, isSelect = false, isFrame = false, isText = false, isImage = false;
+
+        for (SeleniumTarget t : getTargets()) {
+            String raw = (t.getTargetSelector() == null) ? "" : t.getTargetSelector().toLowerCase();
+            String type = (t.getTargetType() == null) ? "" : t.getTargetType().toLowerCase();
+
+
+            if ("linktext".equals(type) || containsCssTag(raw, "a") || containsXpathTag(raw, "a") || containsAttribute(raw, "href")) {
+                isLink = true;
+            }
+
+
+            if ("button".equals(type)
+                    || containsCssTag(raw, "button")
+                    || containsXpathTag(raw, "button")
+                    || containsCssInputType(raw, "submit", "button", "reset")
+                    || containsXpathInputType(raw, "submit", "button", "reset")
+                    || containsAriaRole(raw, "button")) {
+                isButton = true;
+            }
+
+
+            if (containsCssInputType(raw, "checkbox") || containsXpathInputType(raw, "checkbox") || containsAriaRole(raw, "checkbox")) {
+                isCheckbox = true;
+            }
+
+
+            if (containsCssTag(raw, "select") || containsXpathTag(raw, "select")) {
+                isSelect = true;
+            }
+
+
+            if (containsCssTag(raw, "iframe") || containsCssTag(raw, "frame")
+                    || containsXpathTag(raw, "iframe") || containsXpathTag(raw, "frame")) {
+                isFrame = true;
+            }
+
+
+            if (containsCssInputType(raw, "text", "email", "password", "url", "tel", "number", "search")
+                    || containsXpathInputType(raw, "text", "email", "password", "url", "tel", "number", "search")
+                    || containsCssTag(raw, "textarea")
+                    || containsXpathTag(raw, "textarea")) {
+                isText = true;
+            }
+
+
+            if (containsCssTag(raw, "img") || containsXpathTag(raw, "img")) {
+                isImage = true;
+            }
+        }
+
+        if (isLink) return "LinkElement";
+        if (isButton) return "ButtonElement";
+        if (isCheckbox) return "CheckBoxElement";
+        if (isSelect) return "SelectList";
+        if (isFrame) return "FrameElement";
+        if (isText || isTypingCommand) return "TextFieldElement";
+        if (isImage) return "ImageElement";
+
+
+        return "HtmlElement";
+    }
+
+
 }

@@ -2,6 +2,7 @@ package io.github.bhecquet.seleniumRobot.recorder;
 
 import com.google.gson.Gson;
 import com.intellij.openapi.command.WriteCommandAction;
+import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.editor.Editor;
 import com.intellij.openapi.fileEditor.FileEditorManager;
 import com.intellij.openapi.project.Project;
@@ -10,29 +11,30 @@ import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
-import java.util.List;
 
 
 public class SeleniumServlet extends HttpServlet {
 
     private Project project;
 
-    public SeleniumServlet(Project project) {
-        this.project = project;
+    private static final Logger LOG = Logger.getInstance(SeleniumServlet.class);
+
+    private static final java.util.concurrent.ConcurrentMap<String, String> SELECTOR_TO_VAR = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private String keyFor(String selectorLiteral, String frameVarOrNull) {
+        return (frameVarOrNull == null ? "_" : frameVarOrNull) + "|" + selectorLiteral.trim();
+    }
+
+    /**
+     * Extrait "import org..." from doc; util si besoin (optionnel)
+     */
+    private String getText(Editor editor) {
+        return editor.getDocument().getText();
     }
 
 
-    private void insertFrameContextLines(Editor editor, List<String> lines) {
-        if (lines.isEmpty()) {
-            return;
-        }
-        WriteCommandAction.runWriteCommandAction(project, () -> {
-            var doc = editor.getDocument();
-            int pos = editor.getCaretModel().getOffset();
-            String block = String.join("\n", lines) + "\n";
-            doc.insertString(pos, block);
-            editor.getCaretModel().moveToOffset(pos + block.length());
-        });
+    public SeleniumServlet(Project project) {
+        this.project = project;
     }
 
 
@@ -45,14 +47,26 @@ public class SeleniumServlet extends HttpServlet {
             try {
                 SeleniumAction action = new Gson().fromJson(request.getReader(), SeleniumAction.class);
 
+                LOG.info("[Recorder] POST /event reçu");
+                LOG.info("[Recorder] command=" + action.getCommand()
+                        + " element=" + action.getElementName()
+                        + " type=" + action.getElementType()
+                        + " selector=" + action.getSelector()
+                        + " value=" + action.getValue());
 
-//imports
+                if (action.getFramePath() != null) {
+                    LOG.info("[Recorder] framePath size=" + action.getFramePath().size());
+                }
+
+                LOG.info("[Recorder] insertImports()");
+
                 insertImports(editor, action);
 
-//declaration elements
+                LOG.info("[Recorder] insertElement() -> " + action.getElementName());
+
                 insertElement(editor, action);
 
-
+                LOG.info("[Recorder] insertElementAction() -> " + action.getFormattedCommand().trim());
                 insertElementAction(editor, action);
 
             } catch (IOException e) {
@@ -72,16 +86,6 @@ public class SeleniumServlet extends HttpServlet {
         }
     }
 
-    /**
-     * Insert element into class if it does not exist
-     */
-
-    /**
-     * Insert element into class if it does not exist
-     * - Insère les FrameElement en haut du corps de la classe (après '{'), sur une frontière de ligne
-     * - Insère les autres éléments juste après le dernier FrameElement, sur une frontière de ligne
-     * - Évite toute coupure de ligne (insertion milieu de ligne)
-     */
     private String insertElement(Editor editor, SeleniumAction seleniumAction) {
 
         WriteCommandAction.runWriteCommandAction(project, () -> {
@@ -89,53 +93,120 @@ public class SeleniumServlet extends HttpServlet {
             var doc = editor.getDocument();
             String text = doc.getText();
 
-            // --- 1) Position sûre: début du corps de classe (après '{' + fin de ligne)
             int classOpen = text.indexOf('{');
             if (classOpen < 0) {
-                return; // fichier non conforme
+                return;
             }
-            int classBodyStart = indexAfterLineEnd(text, classOpen); // insertion ligne-sûre
+            int classBodyStart = indexAfterLineEnd(text, classOpen);
 
-            // --- 2) Dernière fin de déclaration de frame (fin de ligne)
             int framesBlockEnd = findAfterLastFrameDeclLineEnd(text, classBodyStart);
 
-            // --- 3) Si l'action concerne un frame, insérer le FrameElement (en haut)
+
             if (seleniumAction.getFramePath() != null && !seleniumAction.getFramePath().isEmpty()) {
 
                 FrameInfo fr = seleniumAction.getFramePath().get(seleniumAction.getFramePath().size() - 1);
 
-                String frameVarName = buildFrameVarName(fr); // même algo que côté action, voir plus bas
+                String frameVarName = computeFrameVarName(fr);
                 String selector = fr.getSelector();
                 if (selector == null || selector.trim().isEmpty() || "null".equals(selector.trim())) {
-                    selector = "By.cssSelector(\"iframe\")"; // fallback
+                    selector = "By.cssSelector(\"iframe\")";
                 }
 
+                String logicalId = computeFrameLogicalId(fr); // ex: "testFrame" ou "33c587"
                 String frameDecl =
-                        "\n\tprivate static FrameElement " + frameVarName +
-                                " = new FrameElement(\"" + buildFrameId(fr) + "\", " + selector + ");\n";
+                        "\tprivate static FrameElement " + frameVarName +
+                                " = new FrameElement(\"" + logicalId + "\", " + selector + ");\n";
 
-                // Si pas déjà présent, on l'insère au top des frames (après le dernier frame si existant)
                 if (!containsExactFrameDecl(text, frameVarName)) {
                     int insertPos = (framesBlockEnd != -1) ? framesBlockEnd : classBodyStart;
                     doc.insertString(insertPos, frameDecl);
 
-                    // MAJ du texte et recalcule framesBlockEnd après insertion
+                    // refresh du texte + recalcul du bloc frames
                     text = doc.getText();
                     framesBlockEnd = findAfterLastFrameDeclLineEnd(text, classBodyStart);
                 }
             }
 
-            // --- 4) Insérer l'élément "normal" (HtmlElement, TextFieldElement, ...) après les frames
+
             String elementCode = seleniumAction.getWebElementString();
             String elementType = seleniumAction.getElementType();
             String elementName = seleniumAction.getElementName();
 
+
+            String selectorLiteral = seleniumAction.getSelector();
+            String frameVar = null;
+            if (seleniumAction.getFramePath() != null && !seleniumAction.getFramePath().isEmpty()) {
+                FrameInfo fr = seleniumAction.getFramePath().get(seleniumAction.getFramePath().size() - 1);
+                frameVar = computeFrameVarName(fr);
+            }
+
+
+            Object[] existing = findFieldDeclBySelector(text, selectorLiteral, frameVar);
+
+            if (existing != null) {
+
+
+                String existingSelector = (existing.length >= 5) ? (String) existing[4] : null;
+
+                boolean existingStrong = isStrongSelector(existingSelector);
+                boolean incomingStrong = isStrongSelector(selectorLiteral);
+
+                if (existingStrong && incomingStrong) {
+
+                    String oldName = (String) existing[3];
+                    SELECTOR_TO_VAR.put(keyFor(selectorLiteral, frameVar), oldName);
+                    return;
+                }
+
+            }
+            if (existing != null) {
+                int start = (int) existing[0];
+                int end = (int) existing[1];
+                String oldType = (String) existing[2];
+                String oldName = (String) existing[3];
+
+
+                boolean needUpgrade =
+                        "HtmlElement".equals(oldType)
+                                && ("TextFieldElement".equals(elementType)
+                                || "PasswordFieldElement".equals(elementType)
+                                || "TextAreaElement".equals(elementType));
+
+                if (needUpgrade) {
+                    String newText = replaceFieldType(text, start, end, oldType, elementType);
+                    editor.getDocument().setText(newText);
+
+
+                    SELECTOR_TO_VAR.put(keyFor(selectorLiteral, frameVar), oldName);
+
+
+                    var d2 = editor.getDocument();
+                    String upd2 = d2.getText();
+                    upd2 = reformatFieldZone(upd2);
+                    d2.setText(upd2);
+
+                    return;
+                }
+
+
+                SELECTOR_TO_VAR.put(keyFor(selectorLiteral, frameVar), oldName);
+                return;
+            }
+
+
             if (!containsExactElementDecl(text, elementType, elementName)) {
                 int insertPos = (framesBlockEnd != -1) ? framesBlockEnd : classBodyStart;
-                // si aucun frame, on ajoute un saut de ligne pour l'esthétique
-                String block = (framesBlockEnd == -1 ? "\n" : "") + elementCode;
-                doc.insertString(insertPos, block);
+                elementCode = elementCode.replaceFirst("^\\n+", ""); // pas de \n en tête
+                doc.insertString(insertPos, elementCode);
+                text = doc.getText();
             }
+            SELECTOR_TO_VAR.put(keyFor(selectorLiteral, frameVar), elementName);
+
+
+            var document = editor.getDocument();
+            String updated = document.getText();
+            updated = reformatFieldZone(updated);
+            document.setText(updated);
         });
 
         return null;
@@ -143,13 +214,6 @@ public class SeleniumServlet extends HttpServlet {
 
     /* ======== Helpers d'insertion sûrs ======== */
 
-    /**
-     * Renvoie l'index juste après la fin de ligne qui contient 'pos'
-     */
-    private int indexAfterLineEnd(String text, int pos) {
-        int nl = text.indexOf('\n', pos);
-        return nl >= 0 ? nl + 1 : pos + 1;
-    }
 
     /**
      * Renvoie la fin de ligne suivant la dernière déclaration de FrameElement, ou -1 si aucun.
@@ -210,52 +274,111 @@ public class SeleniumServlet extends HttpServlet {
     }
 
 
+    private boolean isStrongSelector(String selector) {
+        if (selector == null) return false;
+        return selector.startsWith("By.id(")
+                || selector.startsWith("By.name(")
+                || selector.startsWith("By.linkText(")
+                || selector.contains("[data-testid=")
+                || selector.contains("[aria-label=")
+                || selector.contains("href="); // a[href="..."]
+    }
+
+
     private void insertElementAction(Editor editor, SeleniumAction seleniumAction) {
 
-        // Ignorer le bruit sur les SELECT (click/change) : on ne garde que "select"
-        String elementType = seleniumAction.getElementType();
         String cmd = seleniumAction.getCommand();
+        String elementType = seleniumAction.getElementType();
 
-        boolean isSelect = "SelectElement".equals(elementType) || "ListSelect".equals(elementType);
+        boolean isSelect = "SelectElement".equals(elementType) || "SelectList".equals(elementType);
         if (isSelect && ("click".equals(cmd) || "change".equals(cmd))) {
             return;
         }
 
-        // Fusionner les frappes : type / keyup / keydown / sendKeys
-        boolean isTypingCmd = "type".equals(cmd) || "sendKeys".equals(cmd) || "keyup".equals(cmd) || "keydown".equals(cmd);
+        boolean isTypingCmd =
+                "type".equals(cmd) ||
+                        "sendKeys".equals(cmd) ||
+                        "keyup".equals(cmd) ||
+                        "keydown".equals(cmd);
 
-        // Ignore les sendKeys vides (souvent produits lors des pauses / espace / composition)
         if (isTypingCmd && (seleniumAction.getValue() == null || seleniumAction.getValue().isEmpty())) {
             return;
         }
 
-        String code = seleniumAction.getFormattedCommand();
-        String elementName = seleniumAction.getElementName();
-
         WriteCommandAction.runWriteCommandAction(project, () -> {
-            int caretOffset = editor.getCaretModel().getCurrentCaret().getOffset();
+
             var doc = editor.getDocument();
             String text = doc.getText();
+            int caretOffset = editor.getCaretModel().getCurrentCaret().getOffset();
 
-            // Dédupliquer clicks consécutifs sur le même élément
+            // --- 1) Préparation des infos
+            String selectorLiteral = seleniumAction.getSelector();
+            String frameVar = null;
+            if (seleniumAction.getFramePath() != null && !seleniumAction.getFramePath().isEmpty()) {
+                FrameInfo fr = seleniumAction.getFramePath().get(seleniumAction.getFramePath().size() - 1);
+                frameVar = computeFrameVarName(fr);
+            }
+
+            String initialVar = seleniumAction.getElementName(); // ex: usernameField_b309
+            String code = seleniumAction.getFormattedCommand();
+
+
+            String declaredName = SELECTOR_TO_VAR.get(keyFor(selectorLiteral, frameVar));
+
+            if (declaredName == null) {
+                Object[] ex = findFieldDeclBySelector(text, selectorLiteral, frameVar);
+                if (ex != null) {
+                    declaredName = (String) ex[3];
+                    SELECTOR_TO_VAR.put(keyFor(selectorLiteral, frameVar), declaredName);
+                }
+            }
+
+
+            String elementNameUsed = initialVar;
+            if (declaredName != null && !declaredName.equals(initialVar)) {
+                code = code.replace(initialVar + ".", declaredName + ".");
+                elementNameUsed = declaredName;   // ← IMPORTANT
+            }
+
+
             if ("click".equals(cmd)) {
                 String prevLine = previousNonEmptyLine(text, caretOffset);
-                if (prevLine != null && prevLine.contains(elementName + ".click(")) {
+                if (prevLine != null && prevLine.contains(elementNameUsed + ".click(")) {
                     return;
                 }
             }
 
-            // Si c'est une frappe clavier : remplacer la DERNIÈRE ligne sendKeys/setText du même élément
+
             if (isTypingCmd) {
-                int[] lastCallRange = findLastTypingCallRange(text, caretOffset, elementName);
-                if (lastCallRange != null) {
-                    doc.replaceString(lastCallRange[0], lastCallRange[1], code);
-                    editor.getCaretModel().getCurrentCaret().moveToOffset(lastCallRange[0] + code.length());
+                int[] lastRange = findLastTypingCallRange(text, caretOffset, elementNameUsed);
+                if (lastRange != null) {
+                    doc.replaceString(lastRange[0], lastRange[1], code);
+                    editor.getCaretModel().getCurrentCaret().moveToOffset(lastRange[0] + code.length());
                     return;
                 }
             }
 
-            // 5) Sinon insertion normale
+
+            if ("doubleClick".equals(cmd)) {
+
+                String prevLine = previousNonEmptyLine(text, caretOffset);
+
+                if (prevLine != null && prevLine.contains(elementNameUsed + ".click(")) {
+
+
+                    int lineStart = text.lastIndexOf('\n', text.lastIndexOf(prevLine)) + 1;
+                    int lineEnd = text.indexOf('\n', lineStart);
+                    if (lineEnd < 0) lineEnd = text.length();
+
+                    doc.deleteString(lineStart, lineEnd + 1);
+
+                    // mettre à jour caret
+                    editor.getCaretModel().getCurrentCaret().moveToOffset(lineStart);
+
+                    caretOffset = lineStart;
+                }
+            }
+
             doc.insertString(caretOffset, code);
             editor.getCaretModel().getCurrentCaret().moveToOffset(caretOffset + code.length());
         });
@@ -279,21 +402,23 @@ public class SeleniumServlet extends HttpServlet {
      * elementName.sendKeys(...) ou elementName.setText(...) avant caretOffset.
      */
     private int[] findLastTypingCallRange(String text, int caretOffset, String elementName) {
-        String pattern1 = elementName + ".sendKeys(";
-        String pattern2 = elementName + ".setText(";
+        String p1 = elementName + ".sendKeys(";
+        String p2 = elementName + ".setText(";
 
-        int start = Math.min(caretOffset, text.length());
-        int i1 = text.lastIndexOf(pattern1, start);
-        int i2 = text.lastIndexOf(pattern2, start);
+        int startSearch = Math.min(caretOffset, text.length());
+        int i1 = text.lastIndexOf(p1, startSearch);
+        int i2 = text.lastIndexOf(p2, startSearch);
         int idx = Math.max(i1, i2);
-
         if (idx < 0) return null;
 
         int lineStart = text.lastIndexOf('\n', idx) + 1;
         int lineEnd = text.indexOf('\n', idx);
         if (lineEnd < 0) lineEnd = text.length();
 
-        // inclure le \n si possible, pour remplacer proprement toute la ligne
+
+        String between = text.substring(lineEnd, Math.min(caretOffset, text.length()));
+        if (!between.trim().isEmpty()) return null;
+
         int end = (lineEnd + 1 <= text.length()) ? lineEnd + 1 : lineEnd;
         return new int[]{lineStart, end};
     }
@@ -307,150 +432,321 @@ public class SeleniumServlet extends HttpServlet {
     }
 
 
-    /**
-     * Insère les imports nécessaires (By, Keys, HtmlElement, etc.) en tête du fichier.
-     */
     private void insertImports(Editor editor, SeleniumAction seleniumAction) {
-
         WriteCommandAction.runWriteCommandAction(project, () -> {
             var doc = editor.getDocument();
             String content = doc.getText();
 
-            // 1) ✅ Normalise : "package ...;import ..." => "package ...;\nimport ..."
-            content = content.replaceFirst("(?m)^(\\s*package\\s+[^;]+;)(?=\\s*import\\s)", "$1\n");
-
-            // 2) ✅ Déplace les imports placés AVANT le package (restes d'une exécution précédente)
-            java.util.regex.Pattern pkgPat = java.util.regex.Pattern.compile("(?m)^\\s*package\\s+[^;]+;");
-            java.util.regex.Matcher pkgM = pkgPat.matcher(content);
-
-            if (pkgM.find()) {
-                int pkgStart = pkgM.start();
-                if (pkgStart > 0) {
-                    String beforePkg = content.substring(0, pkgStart);
-
-                    java.util.regex.Pattern impPat = java.util.regex.Pattern.compile("(?m)^\\s*import\\s+[^;]+;\\s*$");
-                    java.util.regex.Matcher impM = impPat.matcher(beforePkg);
-
-                    java.util.List<String> preImports = new java.util.ArrayList<>();
-                    while (impM.find()) {
-                        preImports.add(impM.group().trim());
-                    }
-
-                    if (!preImports.isEmpty()) {
-                        // retire ces imports du bloc avant package
-                        String beforeClean = beforePkg.replaceAll("(?m)^\\s*import\\s+[^;]+;\\s*\\R?", "");
-                        content = beforeClean + content.substring(pkgStart);
-
-                        // recalcul end du package après nettoyage
-                        pkgM = pkgPat.matcher(content);
-                        pkgM.find();
-                        int pkgEnd = pkgM.end();
-
-
-                        String movedBlock = "\n" + String.join("\n", preImports) + "\n";
-                        content = content.substring(0, pkgEnd) + movedBlock + content.substring(pkgEnd);
-                    }
-                }
-            }
-
-            // applique la normalisation
+            content = content
+                    .replaceFirst("(?s)^\\s+(?=package\\s+[^;]+;)", "")
+                    .replaceFirst("(?m)^(\\s*package\\s+[^;]+;)[ \\t]*\\R*", "$1\n");
             doc.setText(content);
+            content = doc.getText();
 
-            // 3) ✅ Calcule où insérer : après le dernier import existant (sinon après package)
-            String updated = doc.getText();
-            java.util.regex.Matcher pkg2 = pkgPat.matcher(updated);
-            int basePos = 0;
-            if (pkg2.find()) basePos = pkg2.end();
+            var pkgPat = java.util.regex.Pattern.compile("(?m)^\\s*package\\s+[^;]+;");
+            var pkgM = pkgPat.matcher(content);
+            int pkgEnd = pkgM.find() ? pkgM.end() : 0;
 
-            java.util.regex.Pattern impPat2 = java.util.regex.Pattern.compile("(?m)^\\s*import\\s+[^;]+;\\s*$");
-            java.util.regex.Matcher allImp = impPat2.matcher(updated);
-
-            int lastImportEnd = -1;
-            while (allImp.find()) {
-                if (allImp.start() >= basePos) lastImportEnd = allImp.end();
-            }
-            int insertPos = (lastImportEnd != -1) ? lastImportEnd : basePos;
-
-            // 4) ✅ Ajoute uniquement les imports manquants
-            java.util.List<SeleniumAction> onlyThisAction = java.util.Collections.singletonList(seleniumAction);
-            java.util.Set<String> requiredImports = ImportBuilder.computeImports(onlyThisAction);
-
-            java.util.List<String> missingImports = new java.util.ArrayList<>();
-            for (String imp : requiredImports) {
-                if (!updated.contains(imp)) {
-                    missingImports.add(imp);
+            var impLinePat = java.util.regex.Pattern.compile("(?m)^\\s*import\\s+([^;]+);\\s*$");
+            var m = impLinePat.matcher(content);
+            int firstImpStart = -1, lastImpEnd = -1;
+            java.util.LinkedHashSet<String> existingFqns = new java.util.LinkedHashSet<>();
+            while (m.find()) {
+                if (m.start() >= pkgEnd) {
+                    if (firstImpStart == -1) firstImpStart = m.start();
+                    lastImpEnd = m.end();
+                    existingFqns.add(m.group(1).trim());
                 }
             }
-            if (missingImports.isEmpty()) {
-                return;
+            if (firstImpStart == -1) {
+                firstImpStart = pkgEnd;
+                lastImpEnd = pkgEnd;
             }
 
-            String block = "\n" + String.join("\n", missingImports) + "\n";
-            doc.insertString(insertPos, block + "\n");
+            java.util.Set<String> neededFqns = ImportBuilder.computeImports(
+                    java.util.Collections.singletonList(seleniumAction)
+            );
+
+            java.util.Set<String> union = new java.util.TreeSet<>();
+            union.addAll(existingFqns);
+            union.addAll(neededFqns);
+
+            StringBuilder canon = new StringBuilder();
+            if (firstImpStart == pkgEnd) {
+                canon.append("\n");
+            }
+            for (String fqn : union) {
+                canon.append("import ").append(fqn).append(";\n");
+            }
+
+            doc.replaceString(firstImpStart, lastImpEnd, canon.toString());
         });
     }
 
 
+    // ---- Helpers de mise en forme des champs (déclarations) ----
+
     /**
-     * Retourne la position de l'accolade ouvrante de la classe (après la signature 'class ... {')
+     * Remplace les séquences de \n\n\n+ par au plus une ligne vide (\n\n)
+     * dans la zone des champs entre l’accolade ouvrante de classe et le début du premier method body.
      */
-    private int findClassOpenBracePos(String text) {
-        // naïf mais efficace : on cherche la première '{' après "class "
-        int classIdx = text.indexOf("class ");
-        if (classIdx < 0) {
-            // fallback: première '{' tout court
-            int brace = text.indexOf('{');
-            return brace >= 0 ? brace + 1 : 0;
-        }
-        int brace = text.indexOf('{', classIdx);
-        return brace >= 0 ? brace + 1 : Math.max(0, text.indexOf('{') + 1);
+    private String compactBlankLinesInFieldZone(String text) {
+        int classOpen = text.indexOf('{');
+        if (classOpen < 0) return text;
+        int zoneStart = indexAfterLineEnd(text, classOpen);
+
+
+        java.util.regex.Pattern methodStartPat = java.util.regex.Pattern.compile(
+                "(?m)^\\s*(public|protected|private)\\s+[\\w<>,\\s\\[\\]]+\\s+\\w+\\s*\\("
+        );
+        java.util.regex.Matcher mm = methodStartPat.matcher(text);
+        int zoneEnd = mm.find(zoneStart) ? mm.start() : text.lastIndexOf('}'); // sinon jusqu'à la fin
+
+        if (zoneEnd <= zoneStart) zoneEnd = text.length();
+
+        String before = text.substring(0, zoneStart);
+        String zone = text.substring(zoneStart, zoneEnd);
+        String after = text.substring(zoneEnd);
+
+
+        zone = zone.replaceAll("(?m)\\n{3,}", "\n\n");
+
+
+        zone = zone.replaceAll(
+                "(?m)(^\\s*private\\s+static[\\s\\S]*?;)[ \\t]*\\n\\n(?=\\s*private\\s+static\\s)",
+                "$1\n"
+        );
+
+        return before + zone + after;
     }
 
     /**
-     * Retourne la fin du dernier 'private static FrameElement ...;' trouvé
-     * (ou -1 s'il n'y en a pas)
+     * Garantit qu’il y a exactement UNE ligne vide entre le dernier FrameElement
+     * et la première déclaration non-frame (si des frames existent).
      */
-    private int findLastFrameDeclEnd(String text, int afterPos) {
-        java.util.regex.Pattern framePat = java.util.regex.Pattern.compile(
+    private String ensureSingleBlankAfterFrames(String text) {
+        int classOpen = text.indexOf('{');
+        if (classOpen < 0) return text;
+        int zoneStart = indexAfterLineEnd(text, classOpen);
+
+
+        java.util.regex.Pattern frameLine = java.util.regex.Pattern.compile(
                 "(?m)^\\s*private\\s+static\\s+FrameElement\\s+\\w+\\s*=\\s*new\\s+FrameElement\\s*\\([^;]*\\);\\s*$"
         );
-        java.util.regex.Matcher m = framePat.matcher(text);
-        int lastEnd = -1;
-        while (m.find()) {
-            if (m.start() >= afterPos) {
-                lastEnd = m.end();
-            }
+        java.util.regex.Matcher m = frameLine.matcher(text);
+        int lastFrameEnd = -1;
+        while (m.find(zoneStart)) {
+            int lineEnd = text.indexOf('\n', m.end());
+            lastFrameEnd = (lineEnd == -1) ? text.length() : lineEnd;
         }
-        return lastEnd;
+        if (lastFrameEnd == -1) {
+            return text; // pas de frames
+        }
+
+        int pos = lastFrameEnd;
+        int runStart = pos;
+        int runEnd = pos;
+
+        while (runEnd < text.length() && text.charAt(runEnd) == '\n') runEnd++;
+
+
+        String after = text.substring(runEnd);
+        if (after.startsWith("\n")) {
+            // 2+ vides -> réduire à 1
+            text = text.substring(0, runStart) + "\n\n" + after.replaceFirst("^\\n+", "");
+        } else if (!after.isEmpty() && after.charAt(0) != '\n') {
+            // pas de blanc -> en ajouter 1
+            text = text.substring(0, runStart) + "\n\n" + after;
+        }
+        return text;
     }
 
     /**
-     * Garantit qu'une déclaration de FrameElement est située dans la "zone frame"
-     * (juste après l'accolade ouvrante), en tête des champs.
-     * Si déjà présente, ne fait rien.
+     * Renvoie l'index juste après la fin de ligne qui contient 'pos'
      */
-    private void ensureFrameDeclAtTop(Editor editor, String frameVarName, String frameDecl) {
-        WriteCommandAction.runWriteCommandAction(project, () -> {
-            var doc = editor.getDocument();
-            String text = doc.getText();
+    private int indexAfterLineEnd(String text, int pos) {
+        int nl = text.indexOf('\n', pos);
+        return nl >= 0 ? nl + 1 : pos + 1;
+    }
 
-            // si déjà présent, on ne réinsère pas
-            if (text.contains("private static FrameElement " + frameVarName + " ")) {
-                return;
+    /**
+     * Compacte la zone des champs (entre '{' de la classe et la première méthode):
+     * - Réduit tout excès de lignes vides.
+     * - Force exactement UNE ligne vide après le dernier FrameElement.
+     * - Force ZERO ligne vide entre deux déclarations non-frame.
+     */
+    private String reformatFieldZone(String text) {
+        int classOpen = text.indexOf('{');
+        if (classOpen < 0) return text;
+
+        int zoneStart = indexAfterLineEnd(text, classOpen);
+
+
+        java.util.regex.Pattern methodStartPat = java.util.regex.Pattern.compile(
+                "(?m)^\\s*(public|protected|private)\\s+[\\w<>,\\s\\[\\]]+\\s+\\w+\\s*\\("
+        );
+        java.util.regex.Matcher mm = methodStartPat.matcher(text);
+        int zoneEnd = mm.find(zoneStart) ? mm.start() : text.lastIndexOf('}');
+        if (zoneEnd <= zoneStart) zoneEnd = text.length();
+
+        String before = text.substring(0, zoneStart);
+        String zone = text.substring(zoneStart, zoneEnd);
+        String after = text.substring(zoneEnd);
+
+
+        zone = zone.replaceAll("(?m)\\n{3,}", "\n\n");
+
+        java.util.regex.Pattern frameLine = java.util.regex.Pattern.compile(
+                "(?m)^\\s*private\\s+static\\s+FrameElement\\s+\\w+\\s*=\\s*new\\s+FrameElement\\s*\\([^;]*\\);\\s*$"
+        );
+        java.util.regex.Pattern fieldLine = java.util.regex.Pattern.compile(
+                "(?m)^\\s*private\\s+static\\s+\\w[\\w<>]*Element\\s+\\w+\\s*=\\s*new\\s+\\w[\\w<>]*Element\\s*\\([^;]*\\);\\s*$"
+        );
+
+        String[] lines = zone.split("\\R", -1);
+        StringBuilder out = new StringBuilder();
+        boolean seenAnyFrame = false;
+        int lastFrameLineIndex = -1;
+
+
+        for (int i = 0; i < lines.length; i++) {
+            if (frameLine.matcher(lines[i]).find()) {
+                seenAnyFrame = true;
+                lastFrameLineIndex = i;
+            }
+        }
+
+        boolean afterLastFrameBlankEmitted = !seenAnyFrame; // si pas de frame, pas de blanc spécial
+        for (int i = 0; i < lines.length; i++) {
+            String raw = lines[i];
+            String cur = raw; // ligne telle quelle (sans trim global)
+
+            boolean isEmpty = cur.trim().isEmpty();
+            boolean isFrameDecl = frameLine.matcher(cur).find();
+            boolean isFieldDecl = fieldLine.matcher(cur).find();
+
+
+            if (seenAnyFrame && i > lastFrameLineIndex) {
+
+                if (!afterLastFrameBlankEmitted) {
+
+                    if (isEmpty) {
+
+                        continue;
+                    } else {
+
+                        out.append("\n"); // <-- unique
+                        afterLastFrameBlankEmitted = true;
+                    }
+                }
+
+                if (isEmpty) {
+
+                    continue;
+                }
             }
 
-            // base = après l'accolade ouvrante
-            int classOpenPos = findClassOpenBracePos(text);
 
-            // fin du dernier frame existant
-            int lastFrameEnd = findLastFrameDeclEnd(text, classOpenPos);
+            if (isEmpty) {
 
-            int insertPos = (lastFrameEnd != -1) ? lastFrameEnd : classOpenPos;
+                String prev = lastNonEmptyLine(out);
+                String next = nextNonEmpty(lines, i + 1);
+                boolean prevIsField = prev != null && fieldLine.matcher(prev).find() && !frameLine.matcher(prev).find();
+                boolean nextIsField = next != null && fieldLine.matcher(next).find() && !frameLine.matcher(next).find();
 
-            // si on insère juste après '{', ajoutons un saut de ligne de confort
-            String block = ((lastFrameEnd == -1) ? "\n" : "") + frameDecl;
-            doc.insertString(insertPos, block);
-        });
+                if (prevIsField && nextIsField) {
+
+                    continue;
+                }
+            }
+
+
+            out.append(cur);
+            if (i < lines.length - 1) out.append("\n");
+        }
+
+
+        String zoned = out.toString().replaceAll("(?m)\\n{3,}", "\n\n");
+        return before + zoned + after;
+    }
+
+    /**
+     * Renvoie la dernière ligne non vide déjà écrite dans le StringBuilder (ou null)
+     */
+    private String lastNonEmptyLine(StringBuilder sb) {
+        String s = sb.toString();
+        int i = s.length() - 1;
+
+        while (i >= 0 && (s.charAt(i) == '\n' || s.charAt(i) == '\r')) i--;
+        if (i < 0) return null;
+        int start = s.lastIndexOf("\n", i) + 1;
+        String line = s.substring(start, i + 1);
+        return line.trim().isEmpty() ? null : line;
+    }
+
+    /**
+     * Renvoie la prochaine ligne non vide à partir d'un index dans un tableau de lignes (ou null)
+     */
+    private String nextNonEmpty(String[] lines, int from) {
+        for (int i = from; i < lines.length; i++) {
+            if (!lines[i].trim().isEmpty()) return lines[i];
+        }
+        return null;
+    }
+
+    /**
+     * Id logique de la frame: si ID fourni, on l'utilise; sinon hash du selector. (sans préfixe "frame_")
+     */
+    private String computeFrameLogicalId(FrameInfo fr) {
+        String id = fr.getId();
+        if (id != null && !id.isBlank()) {
+            return id.trim();
+        }
+        String sel = String.valueOf(fr.getSelector());
+        return Integer.toHexString(sel.hashCode());
+    }
+
+    /**
+     * Nom de variable Java: "frame_" + logicalId (sanitizé), sans double préfixe
+     */
+    private String computeFrameVarName(FrameInfo fr) {
+        String logicalId = computeFrameLogicalId(fr);
+        String sanitized = logicalId.replaceAll("[^A-Za-z0-9_]", "_");
+        return "frame_" + sanitized;
+    }
+
+    /**
+     * Cherche une déclaration de champ existante par SELECTOR (texte "By.id(...)" exact) et Frame (optionnelle)
+     * Renvoie {start, end, elementType, elementName} ou null si pas trouvé.
+     */
+    private Object[] findFieldDeclBySelector(String text, String selectorLiteral, String frameVarOrNull) {
+        // pattern: private static <Type> <name> = new <Type>("...", <selector>[, frameVar]?);
+        // on capture le type, le nom, le selecteur et (optionnellement) la frame
+        String selEsc = java.util.regex.Pattern.quote(selectorLiteral.trim());
+        String framePart = (frameVarOrNull == null || frameVarOrNull.isBlank())
+                ? "(?:\\s*,\\s*\\w+)?"
+                : "\\s*,\\s*" + java.util.regex.Pattern.quote(frameVarOrNull);
+        String rx = "(?m)^\\s*private\\s+static\\s+(\\w+)\\s+(\\w+)\\s*=\\s*new\\s+\\1\\s*\\([^;]*?"
+                + selEsc + framePart + "\\s*\\)\\s*;\\s*$";
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(rx);
+        java.util.regex.Matcher m = p.matcher(text);
+        if (m.find()) {
+            int start = m.start();
+            int end = m.end();
+            String type = m.group(1);
+            String name = m.group(2);
+            return new Object[]{start, end, type, name};
+        }
+        return null;
+    }
+
+
+    private String replaceFieldType(String text, int start, int end, String oldType, String newType) {
+        String decl = text.substring(start, end);
+
+        decl = decl.replaceFirst("\\b" + java.util.regex.Pattern.quote(oldType) + "\\b", newType);
+        decl = decl.replaceFirst("new\\s+" + java.util.regex.Pattern.quote(oldType) + "\\b", "new " + newType);
+        return text.substring(0, start) + decl + text.substring(end);
     }
 
 }
